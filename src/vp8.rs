@@ -838,26 +838,134 @@ impl Frame {
 
     /// Fills an rgb buffer with the image
     pub(crate) fn fill_rgb(&self, buf: &mut [u8]) {
+        const BPP: usize = 3;
+
         let mut index = 0_usize;
 
         for (y, row) in buf
-            .chunks_exact_mut(usize::from(self.width) * 3)
+            .chunks_exact_mut(usize::from(self.width) * BPP)
             .enumerate()
         {
-            let chroma_index_row = usize::from(self.chroma_width()) * (y / 2);
+            let chroma_index = usize::from(self.chroma_width()) * (y / 2);
 
-            for (x, rgb_chunk) in row.chunks_exact_mut(3).enumerate() {
-                let chroma_index = chroma_index_row + x / 2;
+            let next_index = index + usize::from(self.width);
+            Frame::fill_rgb_row(
+                &self.ybuf[index..next_index],
+                &self.ubuf[chroma_index..chroma_index + usize::from(self.chroma_width())],
+                &self.vbuf[chroma_index..chroma_index + usize::from(self.chroma_width())],
+                row,
+            );
 
-                Frame::fill_single(
-                    self.ybuf[index],
-                    self.ubuf[chroma_index],
-                    self.vbuf[chroma_index],
-                    rgb_chunk,
-                );
+            index = next_index;
+        }
+    }
 
-                index += 1;
-            }
+    fn fill_rgb_row(y_vec: &[u8], u_vec: &[u8], v_vec: &[u8], rgb: &mut [u8]) {
+        const BPP: usize = 3;
+        // Auto-vectorization is generated at a size of 32
+        const SIZE: usize = 32;
+        const HALF: usize = SIZE / 2;
+
+        const YUV_FIX2: i32 = 6;
+
+        /// _mm_mulhi_epu16 emulation
+        fn mulhi(v: u8, coeff: u16) -> i32 {
+            ((u32::from(v) * u32::from(coeff)) >> 8) as i32
+        }
+
+        fn clip(v: i32) -> u8 {
+            (v.max(0) >> YUV_FIX2).min(255) as u8
+        }
+
+        let mut y_arr = [0; SIZE];
+        let mut coeff_r = [0; HALF];
+        let mut coeff_g = [0; HALF];
+        let mut coeff_b = [0; HALF];
+
+        let mut rgb_chunks = rgb.chunks_exact_mut(SIZE * BPP);
+        let mut y_chunks = y_vec.chunks_exact(SIZE);
+        let mut u_chunks = u_vec.chunks_exact(HALF);
+        let mut v_chunks = v_vec.chunks_exact(HALF);
+
+        // Fill in SIZE pixels at a time, precomputing the coefficients in batches
+        for (((rgb_chunk, y_chunk), u_chunk), v_chunk) in (&mut rgb_chunks)
+            .zip(&mut y_chunks)
+            .zip(&mut u_chunks)
+            .zip(&mut v_chunks)
+        {
+            // Compute y values unique to each pixel
+            y_arr
+                .iter_mut()
+                .zip(y_chunk)
+                .for_each(|(l, &r)| *l = mulhi(r, 19077));
+
+            // Red components
+            coeff_r
+                .iter_mut()
+                .zip(v_chunk)
+                .for_each(|(l, &r)| *l = mulhi(r, 26149) - 14234);
+
+            // Green components
+            coeff_g
+                .iter_mut()
+                .zip(u_chunk)
+                .zip(v_chunk)
+                .for_each(|((l, &u), &v)| *l = -mulhi(u, 6419) - mulhi(v, 13320) + 8708);
+
+            // Blue components
+            coeff_b
+                .iter_mut()
+                .zip(u_chunk)
+                .for_each(|(l, &u)| *l = mulhi(u, 33050) - 17685);
+
+            rgb_chunk
+                .chunks_exact_mut(BPP)
+                .zip(&y_arr)
+                .enumerate()
+                .for_each(|(index, (rgb, &y))| {
+                    rgb[0] = clip(y + coeff_r[index / 2]);
+                    rgb[1] = clip(y + coeff_g[index / 2]);
+                    rgb[2] = clip(y + coeff_b[index / 2]);
+                });
+        }
+
+        // Handle tail pixels in the row
+        {
+            // Compute y values unique to each pixel
+            y_arr
+                .iter_mut()
+                .zip(y_chunks.remainder())
+                .for_each(|(l, &r)| *l = mulhi(r, 19077));
+
+            // Red components
+            coeff_r
+                .iter_mut()
+                .zip(v_chunks.remainder())
+                .for_each(|(l, &r)| *l = mulhi(r, 26149) - 14234);
+
+            // Green components
+            coeff_g
+                .iter_mut()
+                .zip(u_chunks.remainder())
+                .zip(v_chunks.remainder())
+                .for_each(|((l, &u), &v)| *l = -mulhi(u, 6419) - mulhi(v, 13320) + 8708);
+
+            // Blue components
+            coeff_b
+                .iter_mut()
+                .zip(u_chunks.remainder())
+                .for_each(|(l, &u)| *l = mulhi(u, 33050) - 17685);
+
+            rgb_chunks
+                .into_remainder()
+                .chunks_exact_mut(BPP)
+                .zip(&y_arr)
+                .enumerate()
+                .for_each(|(index, (rgb, &y))| {
+                    rgb[0] = clip(y + coeff_r[index / 2]);
+                    rgb[1] = clip(y + coeff_g[index / 2]);
+                    rgb[2] = clip(y + coeff_b[index / 2]);
+                });
         }
     }
 
