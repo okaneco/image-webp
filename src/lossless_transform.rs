@@ -390,8 +390,74 @@ pub(crate) fn apply_color_transform(
     }
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2", feature = "sse_simd")))]
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
     for pixel in image_data.chunks_exact_mut(4) {
+        pixel[0] = pixel[0].wrapping_add(pixel[1]);
+        pixel[2] = pixel[2].wrapping_add(pixel[1]);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2", feature = "sse_simd"))]
+pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    // 32 bytes to unroll the loop twice: 2 x __m128i registers per iteration.
+    const CHUNK_SIZE: usize = 32;
+    const N: usize = 16;
+
+    /// SSE2 translation of `apply_subtract_green_transform`.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn subtract_green_sse2(arr: [u8; N]) -> [u8; N] {
+        // Cast array to 128-bit SIMD type
+        let value = bytemuck::must_cast::<[u8; N], __m128i>(arr);
+        // Shift pixels as if they were u16 from ABGR to 0A0G
+        let a = _mm_srli_epi16(value, 8);
+        // Shuffle lower 64-bits of register to 0G0G, indices = 2-2-0-0 (litte-endian)
+        let b = _mm_shufflelo_epi16(a, 0b1010_0000);
+        // Shuffle higher 64-bits of register to 0G0G
+        let c = _mm_shufflehi_epi16(b, 0b1010_0000);
+        // Wrapping addition to the red and blue pixel values
+        let result = _mm_add_epi8(value, c);
+        // Cast SIMD back to array
+        bytemuck::must_cast::<__m128i, [u8; N]>(result)
+    }
+
+    // Unrolled loop iteration which operates on 32 bytes at a time
+    let mut chunks = image_data.chunks_exact_mut(CHUNK_SIZE);
+    for chunk in &mut chunks {
+        let first_chunk: [u8; N] = TryInto::try_into(&chunk[..N]).unwrap();
+        let second_chunk: [u8; N] = TryInto::try_into(&chunk[N..]).unwrap();
+
+        // SAFETY: `subtract_green_sse2` is safe to call because `x86_64` has
+        // `sse2` as a baseline target feature so its presence is guaranteed.
+        #[allow(unsafe_code)]
+        let (first_chunk, second_chunk) = unsafe {
+            (
+                subtract_green_sse2(first_chunk),
+                subtract_green_sse2(second_chunk),
+            )
+        };
+
+        chunk[..N].copy_from_slice(&first_chunk);
+        chunk[N..].copy_from_slice(&second_chunk);
+    }
+
+    // We can scavenge 1 more SIMD iteration if the remainder >= 16 bytes.
+    let mut chunks = chunks.into_remainder().chunks_exact_mut(N);
+    for chunk in &mut chunks {
+        let first_chunk: [u8; N] = TryInto::try_into(&chunk[..N]).unwrap();
+
+        // SAFETY: `subtract_green_sse2` is safe to call because `x86_64` has
+        // `sse2` as a baseline target feature.
+        #[allow(unsafe_code)]
+        let first_chunk = unsafe { subtract_green_sse2(first_chunk) };
+
+        chunk[..N].copy_from_slice(&first_chunk);
+    }
+
+    for pixel in chunks.into_remainder().chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
         pixel[2] = pixel[2].wrapping_add(pixel[1]);
     }

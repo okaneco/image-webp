@@ -1,6 +1,10 @@
 //! Decoding and Encoding of WebP Images
 
-#![forbid(unsafe_code)]
+// Forbid unsafe_code by default
+#![cfg_attr(not(feature = "sse_simd"), forbid(unsafe_code))]
+// Opt-in feature allows unsafe_code in order to call SIMD target_feature
+// annotated functions
+#![cfg_attr(feature = "sse_simd", deny(unsafe_code))]
 #![deny(missing_docs)]
 // Increase recursion limit for the `quick_error!` macro.
 #![recursion_limit = "256"]
