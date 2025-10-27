@@ -350,6 +350,7 @@ pub fn apply_predictor_transform_13(image_data: &mut [u8], range: Range<usize>, 
     }
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2", feature = "sse_simd")))]
 pub(crate) fn apply_color_transform(
     image_data: &mut [u8],
     width: u16,
@@ -375,6 +376,121 @@ pub(crate) fn apply_color_transform(
             let green_to_red = transform[2];
 
             for pixel in block.chunks_exact_mut(4) {
+                let green = u32::from(pixel[1]);
+                let mut temp_red = u32::from(pixel[0]);
+                let mut temp_blue = u32::from(pixel[2]);
+
+                temp_red += color_transform_delta(green_to_red as i8, green as i8);
+                temp_blue += color_transform_delta(green_to_blue as i8, green as i8);
+                temp_blue += color_transform_delta(red_to_blue as i8, temp_red as i8);
+
+                pixel[0] = (temp_red & 0xff) as u8;
+                pixel[2] = (temp_blue & 0xff) as u8;
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2", feature = "sse_simd"))]
+pub(crate) fn apply_color_transform(
+    image_data: &mut [u8],
+    width: u16,
+    size_bits: u8,
+    transform_data: &[u8],
+) {
+    use std::arch::x86_64::*;
+
+    // Size for exact chunk byte iterator
+    const N: usize = size_of::<__m128i>();
+
+    /// SSE2 version of `apply_color_transform`
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn apply_color_transform_sse2(
+        chunks: &mut std::slice::ChunksExactMut<'_, u8>,
+        red_to_blue: u8,
+        green_to_blue: u8,
+        green_to_red: u8,
+    ) {
+        const MASK_RED_BLUE: __m128i =
+            bytemuck::must_cast::<[u32; 4], __m128i>([0x00ff_00ffu32; 4]);
+        const MASK_GREEN_ALPHA: __m128i =
+            bytemuck::must_cast::<[u32; 4], __m128i>([0xff00_ff00u32; 4]);
+
+        // Constants for delta transform
+        let transform_rb = _mm_set1_epi32(i32::from_le_bytes([0, green_to_red, 0, green_to_blue]));
+        let transform_b0 = _mm_set1_epi32(i32::from_le_bytes([0, 0, 0, red_to_blue]));
+        // Sign extend to convert from u8 to i16
+        let transform_rb = _mm_srai_epi16(transform_rb, 8);
+        let transform_b0 = _mm_srai_epi16(transform_b0, 8);
+
+        for chunk in chunks {
+            // Cast chunk to SIMD register type
+            let ch: [u8; N] = TryInto::try_into(&chunk[..N]).unwrap();
+            let r = bytemuck::must_cast::<[u8; N], __m128i>(ch);
+
+            // Mask pixels to A0G0 to blend with result later
+            let original_green_alpha = _mm_and_si128(r, MASK_GREEN_ALPHA);
+
+            // Sign extend pixels to sAsG, with s being the sign
+            let a = _mm_srai_epi16(r, 8);
+            // Shuffle lower and upper 64-bits of register to 0G0G,
+            // indices = 2-2-0-0 (litte-endian)
+            let b = _mm_shufflelo_epi16(a, 0b1010_0000);
+            let c = _mm_shufflehi_epi16(b, 0b1010_0000);
+            // Delta transform, ((i32 * i32) as u32) >> 5
+            // [green       , sign, green        , sign]
+            // [green_to_red, sign, green_to_blue, sign] - constant
+            let d = _mm_mullo_epi16(c, transform_rb);
+            let e = _mm_srli_epi16(d, 5);
+            let f = _mm_add_epi8(r, e);
+            // Shift `temp_red` to the blue lane and sign extend to i16
+            let g = _mm_bslli_si128::<3>(f);
+            let h = _mm_srai_epi16(g, 8);
+            // Delta transform, ((i32 * i32) as u32) >> 5
+            // [0, 0, temp_red   , sign]
+            // [0, 0, red_to_blue, sign] - constant
+            let i = _mm_mullo_epi16(h, transform_b0);
+            let j = _mm_srli_epi16(i, 5);
+            let k = _mm_add_epi8(f, j);
+            // Mask and blend with original register
+            let result = _mm_or_si128(_mm_and_si128(MASK_RED_BLUE, k), original_green_alpha);
+
+            // Cast back from SIMD to array and copy to output
+            let result = bytemuck::must_cast::<__m128i, [u8; N]>(result);
+            chunk[..N].copy_from_slice(&result);
+        }
+    }
+
+    let block_xsize = usize::from(subsample_size(width, size_bits));
+    let width = usize::from(width);
+
+    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {
+        let row_transform_data_start = (y >> size_bits) * block_xsize * 4;
+        // the length of block_tf_data should be `block_xsize * 4`, so we could slice it with [..block_xsize * 4]
+        // but there is no point - `.zip()` runs until either of the iterators is consumed,
+        // so the extra slicing operation would be doing more work for no reason
+        let row_tf_data = &transform_data[row_transform_data_start..];
+
+        for (block, transform) in row
+            .chunks_mut(4 << size_bits)
+            .zip(row_tf_data.chunks_exact(4))
+        {
+            let red_to_blue = transform[0];
+            let green_to_blue = transform[1];
+            let green_to_red = transform[2];
+
+            let mut blocks = block.chunks_exact_mut(N);
+            // SAFETY: `apply_color_transform_sse2` is safe to call because
+            // `x86_64` guarantees `sse2` as a baseline target feature.
+            #[allow(unsafe_code)]
+            unsafe {
+                // Process chunks of 16 bytes at a time
+                apply_color_transform_sse2(&mut blocks, red_to_blue, green_to_blue, green_to_red);
+            }
+
+            // Scalar fallback
+            for pixel in blocks.into_remainder().chunks_exact_mut(4) {
                 let green = u32::from(pixel[1]);
                 let mut temp_red = u32::from(pixel[0]);
                 let mut temp_blue = u32::from(pixel[2]);
